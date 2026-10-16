@@ -107,8 +107,16 @@ jobs:
       - name: Install cyan
         if: inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore'
         run: |
-          python3 -m pip install \
+          set -euo pipefail
+
+          python3 -m venv "$RUNNER_TEMP/cyan-venv"
+
+          "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install --upgrade pip
+
+          "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install \
             https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+          echo "$RUNNER_TEMP/cyan-venv/bin" >> "$GITHUB_PATH"
 
       - name: iOS SDK Caching
         id: SDK
