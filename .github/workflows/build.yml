@@ -8,57 +8,47 @@ on:
         default: "16.5"
         required: true
         type: string
-
       target_version:
         description: "Target iOS Version"
         default: "15.0"
         required: true
-        type: string
-
       decrypted_ipa_url:
-        description: "Direct URL of a decrypted X IPA (IPA builds only)"
+        description: "Direct URL of an X IPA"
         default: ""
-        required: false
+        required: true
         type: string
-
       deploy_format:
         description: "Deployment format"
         default: sideloaded
         required: true
         type: choice
         options:
+          - rootfull
           - sideloaded
           - trollstore
           - rootless
-          - rootfull
-          - dylib
-
       twitter_branding:
         description: "Set app name to Twitter (IPA builds only)"
         default: true
         required: false
         type: boolean
-
       resource_pack_url:
-        description: "Override app icons ZIP (IPA builds only)"
+        description: "Override app icons (.ZIP) (IPA builds only)"
         default: "https://files.catbox.moe/p63f20.zip"
         required: false
         type: string
-
       commit_id:
         description: "(Optional) Commit ID to build at"
         default: ""
         required: false
         type: string
-
       upload_artifact:
-        description: "Upload build artifact"
+        description: "Upload IPA as artifact (Public)"
         default: true
         required: false
         type: boolean
-
       create_release:
-        description: "Create a draft release"
+        description: "Create a draft release (Private)"
         default: false
         required: false
         type: boolean
@@ -79,18 +69,11 @@ jobs:
         uses: actions/checkout@v6
         with:
           path: main
-          ref: ${{ inputs.commit_id || github.ref }}
+          ref: ${{ github.event.inputs.commit_id || github.ref }}
           submodules: recursive
 
-      - name: Prepare Directories
-        run: |
-          mkdir -p main/packages
-          mkdir -p main/tmp
-
       - name: Install Dependencies
-        run: |
-          brew install make dpkg ldid
-          python3 -m pip install --upgrade pip
+        run: brew install make dpkg ldid
 
       - name: Add GNU Make to PATH
         run: |
@@ -106,136 +89,62 @@ jobs:
 
       - name: Install cyan
         if: inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore'
-        run: |
-          set -euo pipefail
-
-          python3 -m venv "$RUNNER_TEMP/cyan-venv"
-
-          "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install --upgrade pip
-
-          "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install \
-            https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
-
-          echo "$RUNNER_TEMP/cyan-venv/bin" >> "$GITHUB_PATH"
+        run: pip install https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
 
       - name: iOS SDK Caching
         id: SDK
         uses: actions/cache@v6
+        env:
+          cache-name: iOS-${{ inputs.sdk_version }}-SDK
         with:
           path: theos/sdks/
-          key: iOS-${{ inputs.sdk_version }}-SDK
-          restore-keys: |
-            iOS-${{ inputs.sdk_version }}-SDK
+          key: ${{ env.cache-name }}
+          restore-keys: ${{ env.cache-name }}
 
       - name: Download iOS SDK
         if: steps.SDK.outputs.cache-hit != 'true'
+        run: |
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks/
+          cd sdks
+          git sparse-checkout set --no-cone iPhoneOS${{ inputs.sdk_version }}.sdk
+          git checkout
+          mv ./*.sdk "${THEOS}/sdks"
         env:
           THEOS: ${{ github.workspace }}/theos
-          SDK_VERSION: ${{ inputs.sdk_version }}
-        run: |
-          set -euo pipefail
-
-          git clone -n --depth=1 --filter=tree:0 \
-            https://github.com/theos/sdks.git sdks
-
-          cd sdks
-
-          git sparse-checkout set --no-cone \
-            "iPhoneOS${SDK_VERSION}.sdk"
-
-          git checkout
-
-          mkdir -p "$THEOS/sdks"
-
-          mv ./*.sdk "$THEOS/sdks/"
 
       - name: Get Tweak Info
         id: tweak_info
         run: |
-          set -euo pipefail
-
-          TWEAK_NAME=$(sed -n 's/^Name: *//p' main/control | head -n1)
-          TWEAK_VERSION=$(sed -n 's/^Version: *//p' main/control | head -n1)
-
-          if [ -z "$TWEAK_NAME" ] || [ -z "$TWEAK_VERSION" ]; then
-            echo "Could not read Name or Version from main/control."
-            exit 1
-          fi
-
-          echo "name=$TWEAK_NAME" >> "$GITHUB_OUTPUT"
-          echo "version=$TWEAK_VERSION" >> "$GITHUB_OUTPUT"
-
-          echo "Building $TWEAK_NAME version $TWEAK_VERSION"
+          TWEAK_NAME=$(sed -n 's/^Name: *//p' main/control)
+          TWEAK_VERSION=$(awk '/Version:/ {print $2}' main/control)
+          echo "name=${TWEAK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${TWEAK_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "$TWEAK_NAME $TWEAK_VERSION"
 
       - name: Prepare X IPA
         if: inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore'
         id: x_version
+        run: |
+          wget "$IPA_URL" --no-verbose -O main/packages/com.atebits.Tweetie2.ipa
+          unzip -q main/packages/com.atebits.Tweetie2.ipa -d main/tmp
+          X_VERSION=$(grep -A 1 '<key>CFBundleShortVersionString</key>' main/tmp/Payload/Twitter.app/Info.plist |
+            grep '<string>' | awk -F'[><]' '{print $3}')
+          echo "version=${X_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "$X_VERSION"
         env:
           IPA_URL: ${{ inputs.decrypted_ipa_url }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$IPA_URL" ]; then
-            echo "A decrypted IPA URL is required for this format."
-            exit 1
-          fi
-
-          curl -fL --retry 3 "$IPA_URL" \
-            -o main/packages/com.atebits.Tweetie2.ipa
-
-          unzip -q main/packages/com.atebits.Tweetie2.ipa \
-            -d main/tmp
-
-          PLIST="main/tmp/Payload/Twitter.app/Info.plist"
-
-          if [ ! -f "$PLIST" ]; then
-            echo "Twitter.app/Info.plist was not found in the IPA."
-            exit 1
-          fi
-
-          X_VERSION=$(
-            /usr/libexec/PlistBuddy \
-              -c 'Print :CFBundleShortVersionString' "$PLIST"
-          )
-
-          if [ -z "$X_VERSION" ]; then
-            echo "Could not determine the X app version."
-            exit 1
-          fi
-
-          echo "version=$X_VERSION" >> "$GITHUB_OUTPUT"
-          echo "X app version: $X_VERSION"
 
       - name: Prepare Image Pack
         if: inputs.resource_pack_url != '' && (inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore')
+        run: |
+          wget "$IMAGE_URL" --no-verbose -O main/resource-pack.zip
         env:
           IMAGE_URL: ${{ inputs.resource_pack_url }}
-        run: |
-          set -euo pipefail
-
-          curl -fL --retry 3 "$IMAGE_URL" \
-            -o main/resource-pack.zip
-
-          unzip -tq main/resource-pack.zip
 
       - name: Compute ffmpeg Cache Key
         id: ffmpeg-key
         run: |
-          set -euo pipefail
-
-          UPSTREAM_COMMIT=$(
-            git -C main rev-parse \
-              HEAD:deps/ffmpeg-kit-next/upstream 2>/dev/null \
-              || echo unknown
-          )
-
-          SCRIPT_HASH=$(
-            shasum main/deps/ffmpeg-kit-next/build-ffmpeg.sh \
-              | awk '{print $1}'
-          )
-
-          echo "key=ffmpeg-${UPSTREAM_COMMIT}-${SCRIPT_HASH}-sdk${{ inputs.sdk_version }}" \
-            >> "$GITHUB_OUTPUT"
+          echo "key=ffmpeg-stack-sdk$(xcrun --sdk iphoneos --show-sdk-version)-$(git -C main rev-parse --short HEAD:deps/ffmpeg-kit-next/upstream)-${{ hashFiles('main/deps/ffmpeg-kit-next/build-ffmpeg.sh') }}" >> "$GITHUB_OUTPUT"
 
       - name: ffmpeg Stack Caching
         uses: actions/cache@v6
@@ -246,193 +155,54 @@ jobs:
           key: ${{ steps.ffmpeg-key.outputs.key }}
 
       - name: Build Package
+        run: |
+          cd ${{ github.workspace }}/main
+          sed -i '' "s/^TARGET.*$/TARGET := iphone:clang:${{ inputs.sdk_version }}:${{ inputs.target_version }}/" Makefile
+          ./build.sh --${{ inputs.deploy_format }}
         env:
           THEOS: ${{ github.workspace }}/theos
           BUILD_DIR: ${{ github.workspace }}/ffmpeg-build
-          DEPLOY_FORMAT: ${{ inputs.deploy_format }}
-          SDK_VERSION: ${{ inputs.sdk_version }}
-          TARGET_VERSION: ${{ inputs.target_version }}
-        run: |
-          set -Eeuo pipefail
-
-          cd "$GITHUB_WORKSPACE/main"
-
-          # Set the requested SDK and deployment target.
-          sed -i '' \
-            "s/^TARGET.*$/TARGET := iphone:clang:${SDK_VERSION}:${TARGET_VERSION}/" \
-            Makefile
-
-          # Build a standalone tweak dylib.
-          # This does not download, modify, or repackage an IPA.
-          if [ "$DEPLOY_FORMAT" = "dylib" ]; then
-            echo "Building standalone BHTwitter.dylib"
-
-            # Match the dependency preparation performed by build.sh.
-            if [ ! -f deps/ffmpeg-kit-next/build/lib/libffmpegkit.a ]; then
-              git submodule update --init \
-                deps/ffmpeg-kit-next/upstream
-
-              ./deps/ffmpeg-kit-next/build-ffmpeg.sh
-            fi
-
-            if [ -d .theos ]; then
-              rm -rf .theos
-            fi
-
-            make
-
-            DYLIB=".theos/obj/debug/BHTwitter.dylib"
-
-            if [ ! -f "$DYLIB" ]; then
-              DYLIB=$(find .theos -type f \
-                -name 'BHTwitter.dylib' -print -quit)
-            fi
-
-            if [ -z "$DYLIB" ] || [ ! -f "$DYLIB" ]; then
-              echo "BHTwitter.dylib was not generated."
-              echo "Check the Theos compiler output above."
-              exit 1
-            fi
-
-            cp "$DYLIB" \
-              "packages/${{ steps.tweak_info.outputs.name }}-${{ steps.tweak_info.outputs.version }}.dylib"
-
-            echo "Standalone dylib built successfully."
-          else
-            # Existing build.sh handles IPA and Debian package formats.
-            ./build.sh "--${DEPLOY_FORMAT}"
-          fi
 
       - name: Rebrand IPA
         if: (inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore') && (inputs.twitter_branding || inputs.resource_pack_url != '')
-        env:
-          TWITTER_BRANDING: ${{ inputs.twitter_branding }}
         run: |
-          set -euo pipefail
+          cd ${{ github.workspace }}/main
+          IMAGE_FLAG=""
+          if [ -f resource-pack.zip ]; then IMAGE_FLAG="--resource-pack resource-pack.zip"; fi
+          ./rebrand.sh${{ inputs.twitter_branding && ' --twitter-branding' || '' }} $IMAGE_FLAG \
+            "packages/$(ls -t packages | head -n1)"
 
-          cd "$GITHUB_WORKSPACE/main"
-
-          IMAGE_FLAG=()
-
-          if [ -f resource-pack.zip ]; then
-            IMAGE_FLAG=(--resource-pack resource-pack.zip)
-          fi
-
-          BRANDING_FLAG=()
-
-          if [ "$TWITTER_BRANDING" = "true" ]; then
-            BRANDING_FLAG=(--twitter-branding)
-          fi
-
-          IPA_FILE=$(find packages -maxdepth 1 -type f \
-            -name '*.ipa' -print -quit)
-
-          if [ -z "$IPA_FILE" ]; then
-            echo "No IPA file was found to rebrand."
-            exit 1
-          fi
-
-          ./rebrand.sh \
-            "${BRANDING_FLAG[@]}" \
-            "${IMAGE_FLAG[@]}" \
-            "$IPA_FILE"
-
-      - name: Rename IPA
+      - name: Rename IPA to include IPA version
         if: inputs.deploy_format == 'sideloaded' || inputs.deploy_format == 'trollstore'
+        run: |
+          mv "main/packages/$(ls -t main/packages | head -n1)" \
+             "main/packages/${{ steps.tweak_info.outputs.name }}-${BRANDING}-${{ inputs.deploy_format }}_${{ steps.tweak_info.outputs.version }}_${{ steps.x_version.outputs.version }}.${IPA_EXT}"
         env:
           IPA_EXT: ${{ inputs.deploy_format == 'trollstore' && 'tipa' || 'ipa' }}
           BRANDING: ${{ inputs.twitter_branding && 'Twitter' || 'X' }}
-          TWEAK_NAME: ${{ steps.tweak_info.outputs.name }}
-          TWEAK_VERSION: ${{ steps.tweak_info.outputs.version }}
-          X_VERSION: ${{ steps.x_version.outputs.version }}
-        run: |
-          set -euo pipefail
 
-          IPA_FILE=$(find main/packages -maxdepth 1 -type f \
-            -name '*.ipa' -print -quit)
-
-          if [ -z "$IPA_FILE" ]; then
-            echo "No IPA file was found to rename."
-            exit 1
-          fi
-
-          OUTPUT="main/packages/${TWEAK_NAME}-${BRANDING}-${{ inputs.deploy_format }}_${TWEAK_VERSION}_${X_VERSION}.${IPA_EXT}"
-
-          mv "$IPA_FILE" "$OUTPUT"
-
-          echo "Created: $OUTPUT"
-
-      - name: Collect Dylib
-        if: inputs.deploy_format == 'dylib'
-        run: |
-          set -euo pipefail
-
-          OUTPUT="main/packages/${{ steps.tweak_info.outputs.name }}-${{ steps.tweak_info.outputs.version }}.dylib"
-
-          if [ ! -s "$OUTPUT" ]; then
-            echo "The expected dylib output is missing or empty."
-            exit 1
-          fi
-
-          echo "Dylib ready: $OUTPUT"
-          file "$OUTPUT"
-          ls -lh "$OUTPUT"
-
-      - name: Pass Package Name
+      - name: Pass package name
         id: package_name
-        env:
-          DEPLOY_FORMAT: ${{ inputs.deploy_format }}
         run: |
-          set -euo pipefail
-
-          case "$DEPLOY_FORMAT" in
-            sideloaded)
-              PATTERN='*.ipa'
-              ;;
-            trollstore)
-              PATTERN='*.tipa'
-              ;;
-            rootless|rootfull)
-              PATTERN='*.deb'
-              ;;
-            dylib)
-              PATTERN='*.dylib'
-              ;;
-            *)
-              echo "Unsupported deployment format: $DEPLOY_FORMAT"
-              exit 1
-              ;;
-          esac
-
-          PACKAGE=$(find main/packages -maxdepth 1 -type f \
-            -name "$PATTERN" -print -quit)
-
-          if [ -z "$PACKAGE" ] || [ ! -s "$PACKAGE" ]; then
-            echo "No valid build output found for $DEPLOY_FORMAT."
-            echo "Files in main/packages:"
-            ls -lah main/packages
-            exit 1
-          fi
-
-          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
-          echo "Selected artifact: $PACKAGE"
+          echo "package=$(ls -t main/packages | head -n1)" >> "$GITHUB_OUTPUT"
 
       - name: Upload Artifact
-        if: inputs.upload_artifact
+        if: ${{ inputs.upload_artifact }}
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.tweak_info.outputs.name }}_${{ steps.tweak_info.outputs.version }}_${{ inputs.deploy_format }}
-          path: ${{ github.workspace }}/${{ steps.package_name.outputs.package }}
+          name: ${{ steps.tweak_info.outputs.name }}_${{ steps.tweak_info.outputs.version }}
+          path: ${{ github.workspace }}/main/packages/${{ steps.package_name.outputs.package }}
           archive: false
           if-no-files-found: error
 
       - name: Create Draft Release
-        if: inputs.create_release
+        if: ${{ inputs.create_release }}
+        id: create_release
         uses: softprops/action-gh-release@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: v${{ steps.tweak_info.outputs.version }}
           name: v${{ steps.tweak_info.outputs.version }} - ${{ steps.tweak_info.outputs.name }}
-          files: ${{ steps.package_name.outputs.package }}
+          files: main/packages/${{ steps.package_name.outputs.package }}
           draft: true
